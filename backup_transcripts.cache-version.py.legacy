@@ -1,0 +1,781 @@
+#!/usr/bin/env python3
+"""
+Daily backup script for Granola meeting transcripts.
+Reads from Granola's cache and saves transcripts as markdown files.
+
+Features:
+- Personal vs work meeting classification
+- Year/month subdirectories for new files
+- Cross-links between transcript, notes, and chat for same meeting
+- Consistent frontmatter with participants, tags, and granola_id
+- Privacy flag for personal meetings
+- Dry-run mode for previewing changes
+
+CONFIGURATION: Set OUTPUT dirs below to your desired locations
+"""
+
+import json
+import os
+import re
+from pathlib import Path
+from datetime import datetime, timezone
+import zoneinfo
+import sys
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+VAULT_ROOT = os.path.expanduser("~/Documents/Manual Library/grey-rose")
+
+WORK_OUTPUT_DIR = os.path.join(VAULT_ROOT, "Projects/MaidCentral/Meetings")
+PERSONAL_OUTPUT_DIR = os.path.join(VAULT_ROOT, "Projects/Personal/Meetings")
+
+TIMEZONE = os.getenv("GRANOLA_TIMEZONE", None)
+def _find_granola_cache():
+    """Find the latest Granola cache file, regardless of version number."""
+    import glob
+    pattern = os.path.expanduser("~/Library/Application Support/Granola/cache-v*.json")
+    candidates = [f for f in glob.glob(pattern) if not f.endswith(".tmp")]
+    if candidates:
+        # Pick the highest version number
+        candidates.sort(reverse=True)
+        return candidates[0]
+    # Fallback to known path
+    return os.path.expanduser("~/Library/Application Support/Granola/cache-v4.json")
+
+GRANOLA_CACHE_PATH = _find_granola_cache()
+
+STATUS_FILE = os.path.expanduser("~/.granola-backup-status.json")
+
+DRY_RUN = "--dry-run" in sys.argv
+
+
+# ============================================================================
+# Status tracking
+# ============================================================================
+
+def write_status(success, saved_count=0, error_msg=None):
+    """Write backup status to a JSON file for SessionStart hook to check."""
+    now = datetime.now(timezone.utc).isoformat()
+    status = {
+        "last_run": now,
+        "success": success,
+        "saved_count": saved_count,
+    }
+    if saved_count > 0:
+        status["last_saved"] = now
+    else:
+        # Preserve last_saved from previous runs
+        prev = _read_status()
+        if prev and prev.get("last_saved"):
+            status["last_saved"] = prev["last_saved"]
+
+    if error_msg:
+        status["error"] = error_msg
+
+    try:
+        with open(STATUS_FILE, "w") as f:
+            json.dump(status, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not write status file: {e}")
+
+
+def _read_status():
+    """Read previous status file if it exists."""
+    try:
+        if os.path.exists(STATUS_FILE):
+            with open(STATUS_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+# ============================================================================
+# Meeting classification
+# ============================================================================
+
+PERSONAL_TITLE_PATTERNS = [
+    r"therapy",
+    r"martin",
+    r"dr[\.\s]?hess",
+    r"shell[\s._-]?game",
+    r"mini[\s._-]?convo",
+    r"project[\s._-]?martina",
+    r"off[\s._-]?by[\s._-]?5",
+    r"family[\s._-]?meeting",
+    r"christina",
+    r"dentist",
+    r"vet\b",
+    r"doctor",
+    r"personal",
+    r"leon.*ppo",
+    r"lenny.*mercer",
+    r"mentorship.*slot",
+]
+
+# If a meeting has ONLY these participants (plus Kourtney), it's personal
+KNOWN_PERSONAL_CONTACTS = [
+    "martin", "christina", "leon", "lenny", "mercer",
+]
+
+WORK_PARTICIPANTS = [
+    "tom", "amanda", "amandah", "austin", "alvin", "troy",
+    "mark", "randall", "greg", "jon", "dena", "cece",
+    "ajia", "victoria", "blake", "maks", "suhani", "yodit",
+    "ryan", "arthur", "nathan", "sara",
+]
+
+
+def classify_meeting(title, participants):
+    """Return 'personal' or 'work' based on meeting content."""
+    title_lower = (title or "Untitled Meeting").lower()
+
+    # Check title patterns first
+    for pattern in PERSONAL_TITLE_PATTERNS:
+        if re.search(pattern, title_lower):
+            return "personal"
+
+    # Check participants
+    participant_names = [p.lower() for p in participants]
+    for work_person in WORK_PARTICIPANTS:
+        if any(work_person in name for name in participant_names):
+            return "work"
+
+    # Default to work (safer — personal meetings are the exception)
+    return "work"
+
+
+def generate_tags(meeting_title, classification):
+    """Generate tags based on meeting title keywords and classification."""
+    if classification == "personal":
+        tags = ["meeting", "personal"]
+    else:
+        tags = ["meeting", "maidcentral"]
+
+    title_lower = meeting_title.lower()
+
+    if any(word in title_lower for word in ["revenue", "sales", "pipeline"]):
+        tags.append("revenue")
+    if any(word in title_lower for word in ["marketing", "content", "blog"]):
+        tags.append("marketing")
+    if any(word in title_lower for word in ["demo", "presentation"]):
+        tags.append("demo")
+    if any(word in title_lower for word in ["strategy", "planning"]):
+        tags.append("strategy")
+    if any(word in title_lower for word in ["weekly", "sync", "standup"]):
+        tags.append("recurring")
+    if any(word in title_lower for word in ["ai", "automation"]):
+        tags.append("ai")
+    if any(word in title_lower for word in ["1:1", "1-1", "<>"]):
+        tags.append("one-on-one")
+    if any(word in title_lower for word in ["therapy"]):
+        tags.append("therapy")
+    if any(word in title_lower for word in ["onboarding", "graduation"]):
+        tags.append("onboarding")
+    if any(word in title_lower for word in ["implementation"]):
+        tags.append("implementation")
+
+    return tags
+
+
+# ============================================================================
+# Timezone detection (unchanged)
+# ============================================================================
+
+def detect_timezone():
+    """Auto-detect system timezone."""
+    if TIMEZONE:
+        try:
+            return zoneinfo.ZoneInfo(TIMEZONE)
+        except Exception:
+            print(f"Warning: Invalid timezone '{TIMEZONE}', using auto-detection")
+
+    try:
+        import time
+        if hasattr(time, "tzname") and time.tzname:
+            tz_mapping = {
+                "EST": "America/New_York", "EDT": "America/New_York",
+                "CST": "America/Chicago", "CDT": "America/Chicago",
+                "MST": "America/Denver", "MDT": "America/Denver",
+                "PST": "America/Los_Angeles", "PDT": "America/Los_Angeles",
+            }
+            current_tz = time.tzname[time.daylight]
+            if current_tz in tz_mapping:
+                return zoneinfo.ZoneInfo(tz_mapping[current_tz])
+
+        local_offset = time.timezone if not time.daylight else time.altzone
+        hours_offset = -local_offset // 3600
+        offset_mapping = {
+            -8: "America/Los_Angeles", -7: "America/Denver",
+            -6: "America/Chicago", -5: "America/New_York",
+            -4: "America/New_York",
+        }
+        if hours_offset in offset_mapping:
+            return zoneinfo.ZoneInfo(offset_mapping[hours_offset])
+    except Exception as e:
+        print(f"Warning: Error detecting timezone: {e}")
+
+    return zoneinfo.ZoneInfo("UTC")
+
+
+# ============================================================================
+# Cache parsing (unchanged)
+# ============================================================================
+
+def load_granola_cache():
+    """Load and parse Granola cache file."""
+    try:
+        cache_path = Path(GRANOLA_CACHE_PATH)
+        if not cache_path.exists():
+            print(f"ERROR: Cache file not found at {GRANOLA_CACHE_PATH}")
+            return None
+
+        with open(cache_path, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+
+        if "cache" in raw_data:
+            cache = raw_data["cache"]
+            # v3: cache is a JSON string
+            if isinstance(cache, str):
+                actual_data = json.loads(cache)
+            else:
+                actual_data = cache
+            if "state" in actual_data:
+                return actual_data["state"]
+            return actual_data
+
+        return raw_data
+
+    except Exception as e:
+        print(f"ERROR loading cache: {e}")
+        return None
+
+
+def parse_meetings(cache_data):
+    """Extract meeting metadata from cache."""
+    meetings = {}
+
+    if "documents" not in cache_data:
+        return meetings
+
+    for meeting_id, meeting_data in cache_data["documents"].items():
+        try:
+            participants = []
+            people = meeting_data.get("people")
+            if isinstance(people, list):
+                # v3 format: list of person dicts
+                participants = [
+                    person.get("name", "")
+                    for person in people
+                    if person.get("name")
+                ]
+            elif isinstance(people, dict):
+                # v4 format: dict with attendees list, or check google_calendar_event
+                attendees = people.get("attendees", [])
+                for a in attendees:
+                    if isinstance(a, dict) and a.get("name"):
+                        participants.append(a["name"])
+            # Fallback: extract attendees from google_calendar_event
+            if not participants:
+                gce = meeting_data.get("google_calendar_event", {})
+                if isinstance(gce, dict):
+                    for a in gce.get("attendees", []):
+                        email = a.get("email", "")
+                        if email and not a.get("self"):
+                            name = email.split("@")[0].replace(".", " ").title()
+                            participants.append(name)
+
+            created_at = meeting_data.get("created_at")
+            if created_at:
+                if created_at.endswith("Z"):
+                    created_at = created_at[:-1] + "+00:00"
+                meeting_date = datetime.fromisoformat(created_at)
+                if meeting_date.tzinfo is None:
+                    meeting_date = meeting_date.replace(
+                        tzinfo=zoneinfo.ZoneInfo("UTC")
+                    )
+            else:
+                meeting_date = datetime.now(zoneinfo.ZoneInfo("UTC"))
+
+            meetings[meeting_id] = {
+                "id": meeting_id,
+                "title": meeting_data.get("title", "Untitled Meeting"),
+                "date": meeting_date,
+                "participants": participants,
+                "type": meeting_data.get("type", "meeting"),
+            }
+        except Exception as e:
+            print(f"Warning: Error parsing meeting {meeting_id}: {e}")
+
+    return meetings
+
+
+def parse_transcripts(cache_data):
+    """Extract transcripts from cache."""
+    transcripts = {}
+
+    if "transcripts" not in cache_data:
+        return transcripts
+
+    for transcript_id, transcript_data in cache_data["transcripts"].items():
+        try:
+            content_parts = []
+            speakers_set = set()
+
+            if isinstance(transcript_data, list):
+                for segment in transcript_data:
+                    if isinstance(segment, dict) and "text" in segment:
+                        text = segment["text"].strip()
+                        if text:
+                            content_parts.append(text)
+                        if "source" in segment:
+                            speakers_set.add(segment["source"])
+
+            if content_parts:
+                transcripts[transcript_id] = {
+                    "content": " ".join(content_parts),
+                    "speakers": list(speakers_set),
+                }
+
+        except Exception as e:
+            print(f"Warning: Error parsing transcript {transcript_id}: {e}")
+
+    return transcripts
+
+
+def extract_text_from_prosemirror(node):
+    """Extract plain text from prosemirror-like document structure."""
+    texts = []
+    if isinstance(node, dict):
+        if "text" in node:
+            texts.append(node["text"])
+        if "content" in node:
+            texts.extend(extract_text_from_prosemirror(node["content"]))
+    elif isinstance(node, list):
+        for item in node:
+            texts.extend(extract_text_from_prosemirror(item))
+    return texts
+
+
+def parse_notes(cache_data):
+    """Extract AI-generated notes from documentPanels (v3) or inline notes_markdown (v4)."""
+    notes = {}
+
+    # v3: documentPanels
+    panels = cache_data.get("documentPanels", {})
+    for doc_id, doc_panels in panels.items():
+        if not isinstance(doc_panels, dict):
+            continue
+
+        sections = []
+        for panel_id, panel in doc_panels.items():
+            if isinstance(panel, dict):
+                title = panel.get("title", "")
+                content = panel.get("content", {})
+                text = " ".join(extract_text_from_prosemirror(content))
+                if text.strip():
+                    sections.append({"title": title, "content": text})
+
+        if sections:
+            notes[doc_id] = sections
+
+    # v4: notes_markdown inline on documents
+    documents = cache_data.get("documents", {})
+    for doc_id, doc in documents.items():
+        if doc_id in notes:
+            continue  # already got from panels
+        notes_md = doc.get("notes_markdown", "")
+        if notes_md and len(notes_md) > 50:  # skip tiny stubs
+            notes[doc_id] = [{"title": "Notes", "content": notes_md}]
+
+    return notes
+
+
+def parse_chat_history(cache_data):
+    """Extract AI chat conversations from meetingChatHistory."""
+    chats = {}
+    chat_history = cache_data.get("meetingChatHistory", {})
+
+    for meeting_id, chat_data in chat_history.items():
+        messages = (
+            chat_data.get("messages", []) if isinstance(chat_data, dict) else []
+        )
+        if not messages:
+            continue
+
+        formatted = []
+        for msg in messages:
+            role = msg.get("role", "UNKNOWN")
+            text = msg.get("text", "")
+            if text:
+                formatted.append({"role": role, "text": text})
+
+        if formatted:
+            chats[meeting_id] = formatted
+
+    return chats
+
+
+# ============================================================================
+# Filename helpers
+# ============================================================================
+
+def create_safe_title(meeting_title):
+    """Create a filesystem-safe version of a meeting title."""
+    safe = "".join(
+        c for c in meeting_title if c.isalnum() or c in (" ", "-", "_")
+    ).strip()
+    safe = safe.replace(" ", "_")
+    return safe[:100]
+
+
+def create_safe_title_kebab(meeting_title):
+    """Create a kebab-case version for notes/chat filenames."""
+    safe = "".join(
+        c for c in meeting_title if c.isalnum() or c in (" ", "-", "_")
+    ).strip()
+    safe = safe.replace(" ", "-").lower()
+    return safe[:50]
+
+
+def get_output_dir(base_dir, meeting_date, local_tz):
+    """Get year/month subdirectory for a meeting."""
+    local_date = meeting_date.astimezone(local_tz)
+    return Path(base_dir) / local_date.strftime("%Y") / local_date.strftime("%m")
+
+
+def file_exists_anywhere(base_dir, filename):
+    """Check if file exists in base_dir (flat, legacy) or any subdirectory."""
+    # Check flat (legacy location)
+    if (Path(base_dir) / filename).exists():
+        return True
+    # Check year/month subdirs
+    for path in Path(base_dir).rglob(filename):
+        return True
+    return False
+
+
+def build_related_links(meeting, local_tz, base_dir, file_type):
+    """Generate wiki-links to sibling files for the same meeting."""
+    local_date = meeting["date"].astimezone(local_tz)
+    date_str = local_date.strftime("%Y-%m-%d")
+    time_str = local_date.strftime("%H%M")
+    safe_title_underscore = create_safe_title(meeting["title"])
+    safe_title_kebab = create_safe_title_kebab(meeting["title"])
+
+    transcript_name = f"{date_str}_{time_str}_{safe_title_underscore}"
+    notes_name = f"{date_str}-{safe_title_kebab}-notes"
+    chat_name = f"{date_str}-{safe_title_kebab}-chat"
+
+    links = []
+    if file_type != "transcript":
+        links.append(f"- [[{transcript_name}|Transcript]]")
+    if file_type != "notes":
+        links.append(f"- [[{notes_name}|Notes]]")
+    if file_type != "chat":
+        links.append(f"- [[{chat_name}|Chat]]")
+
+    if not links:
+        return ""
+
+    return "\n---\n\n## Related\n\n" + "\n".join(links) + "\n"
+
+
+def format_tags_inline(tags):
+    """Format tags as inline YAML array."""
+    return "tags: [" + ", ".join(tags) + "]"
+
+
+def format_participants_frontmatter(participants):
+    """Format participants as frontmatter with wiki-link backlinks."""
+    if not participants:
+        return ""
+    lines = ["participants:"]
+    for p in participants:
+        lines.append(f'  - "[[{p}]]"')
+    return "\n".join(lines)
+
+
+# ============================================================================
+# Save functions
+# ============================================================================
+
+def save_transcript_to_file(meeting, transcript, base_dir, local_tz, classification):
+    """Save a meeting transcript as a markdown file."""
+    try:
+        output_path = get_output_dir(base_dir, meeting["date"], local_tz)
+
+        local_date = meeting["date"].astimezone(local_tz)
+        date_str = local_date.strftime("%Y-%m-%d %H:%M %Z")
+        date_only = local_date.strftime("%Y-%m-%d")
+
+        filename = f"{date_only}_{local_date.strftime('%H%M')}_{create_safe_title(meeting['title'])}.md"
+
+        # Check both legacy flat path and new year/month path
+        if file_exists_anywhere(base_dir, filename):
+            print(f"  Already exists: {filename}")
+            return False
+
+        tags = generate_tags(meeting["title"], classification)
+        participant_links = (
+            [f"[[{p}]]" for p in meeting["participants"]]
+            if meeting["participants"]
+            else []
+        )
+
+        # Build frontmatter
+        md = "---\n"
+        md += f"date: {date_only}\n"
+        md += f'time: "{local_date.strftime("%H:%M")}"\n'
+        md += "type: meeting\n"
+        md += f"{format_tags_inline(tags)}\n"
+        if meeting["participants"]:
+            md += f"{format_participants_frontmatter(meeting['participants'])}\n"
+        md += f"granola_id: {meeting['id']}\n"
+        if classification == "personal":
+            md += "private: true\n"
+        md += "---\n\n"
+
+        # Build content
+        md += f"# {meeting['title']}\n\n"
+        md += f"**Date:** {date_str}\n"
+        if participant_links:
+            md += f"**Participants:** {', '.join(participant_links)}\n"
+        if transcript.get("speakers"):
+            md += f"**Speakers:** {', '.join(transcript['speakers'])}\n"
+        md += f"\n---\n\n## Transcript\n\n{transcript['content']}\n"
+
+        # Add cross-links
+        md += build_related_links(meeting, local_tz, base_dir, "transcript")
+
+        if DRY_RUN:
+            print(f"  [DRY RUN] Would save transcript: {output_path / filename}")
+            return True
+
+        output_path.mkdir(parents=True, exist_ok=True)
+        with open(output_path / filename, "w", encoding="utf-8") as f:
+            f.write(md)
+
+        print(f"  ✓ Saved: {filename}")
+        return True
+
+    except Exception as e:
+        print(f"  ERROR saving {meeting['title']}: {e}")
+        return False
+
+
+def save_notes_to_file(meeting, notes_sections, base_dir, local_tz, classification):
+    """Save AI-generated notes as a markdown file."""
+    try:
+        output_path = get_output_dir(base_dir, meeting["date"], local_tz)
+
+        local_date = meeting["date"].astimezone(local_tz)
+        date_str = local_date.strftime("%Y-%m-%d")
+        safe_title = create_safe_title_kebab(meeting["title"])
+        filename = f"{date_str}-{safe_title}-notes.md"
+
+        if file_exists_anywhere(base_dir, filename):
+            print(f"  Notes exist: {filename}")
+            return False
+
+        tags = generate_tags(meeting["title"], classification)
+        if "notes" not in tags:
+            tags.append("notes")
+
+        sections_md = "\n\n".join(
+            [f"## {s['title']}\n\n{s['content']}" for s in notes_sections]
+        )
+
+        md = "---\n"
+        md += f"date: {date_str}\n"
+        md += f'time: "{local_date.strftime("%H:%M")}"\n'
+        md += "type: meeting-notes\n"
+        md += f"{format_tags_inline(tags)}\n"
+        if meeting["participants"]:
+            md += f"{format_participants_frontmatter(meeting['participants'])}\n"
+        md += f"granola_id: {meeting['id']}\n"
+        if classification == "personal":
+            md += "private: true\n"
+        md += "---\n\n"
+
+        md += f"# {meeting['title']}\n\n"
+        md += f"**Date:** {date_str} {local_date.strftime('%H:%M %Z')}\n"
+        if meeting["participants"]:
+            participant_links = [f"[[{p}]]" for p in meeting["participants"]]
+            md += f"**Participants:** {', '.join(participant_links)}\n"
+        md += f"\n---\n\n{sections_md}\n"
+
+        md += build_related_links(meeting, local_tz, base_dir, "notes")
+
+        if DRY_RUN:
+            print(f"  [DRY RUN] Would save notes: {output_path / filename}")
+            return True
+
+        output_path.mkdir(parents=True, exist_ok=True)
+        with open(output_path / filename, "w", encoding="utf-8") as f:
+            f.write(md)
+
+        return True
+
+    except Exception as e:
+        print(f"  ERROR saving notes for {meeting['title']}: {e}")
+        return False
+
+
+def save_chat_to_file(meeting, chat_messages, base_dir, local_tz, classification):
+    """Save AI chat conversation as a markdown file."""
+    try:
+        output_path = get_output_dir(base_dir, meeting["date"], local_tz)
+
+        local_date = meeting["date"].astimezone(local_tz)
+        date_str = local_date.strftime("%Y-%m-%d")
+        safe_title = create_safe_title_kebab(meeting["title"])
+        filename = f"{date_str}-{safe_title}-chat.md"
+
+        if file_exists_anywhere(base_dir, filename):
+            print(f"  Chat exists: {filename}")
+            return False
+
+        tags = generate_tags(meeting["title"], classification)
+        if "chat" not in tags:
+            tags.append("chat")
+
+        chat_md = ""
+        for msg in chat_messages:
+            if msg["role"] == "USER":
+                chat_md += f"**You:** {msg['text']}\n\n"
+            else:
+                chat_md += f"**Granola:** {msg['text']}\n\n"
+
+        md = "---\n"
+        md += f"date: {date_str}\n"
+        md += "type: meeting-chat\n"
+        md += f"{format_tags_inline(tags)}\n"
+        md += f"granola_id: {meeting['id']}\n"
+        if classification == "personal":
+            md += "private: true\n"
+        md += "---\n\n"
+
+        md += f"# Chat: {meeting['title']}\n\n"
+        md += f"**Date:** {date_str}\n"
+        md += f"\n---\n\n{chat_md}"
+
+        md += build_related_links(meeting, local_tz, base_dir, "chat")
+
+        if DRY_RUN:
+            print(f"  [DRY RUN] Would save chat: {output_path / filename}")
+            return True
+
+        output_path.mkdir(parents=True, exist_ok=True)
+        with open(output_path / filename, "w", encoding="utf-8") as f:
+            f.write(md)
+
+        return True
+
+    except Exception as e:
+        print(f"  ERROR saving chat for {meeting['title']}: {e}")
+        return False
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main():
+    """Main backup function."""
+    local_tz = detect_timezone()
+
+    if DRY_RUN:
+        print("\n=== Granola Backup (DRY RUN) ===")
+    else:
+        print("\n=== Granola Backup ===")
+    print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Work output: {WORK_OUTPUT_DIR}")
+    print(f"Personal output: {PERSONAL_OUTPUT_DIR}")
+    print(f"Timezone: {local_tz}\n")
+
+    print("Loading Granola cache...")
+    cache_data = load_granola_cache()
+    if not cache_data:
+        write_status(success=False, error_msg="Failed to load Granola cache")
+        print("Failed to load cache. Exiting.")
+        sys.exit(1)
+
+    print("Parsing data...")
+    meetings = parse_meetings(cache_data)
+    transcripts = parse_transcripts(cache_data)
+    notes = parse_notes(cache_data)
+    chats = parse_chat_history(cache_data)
+
+    print(
+        f"Found: {len(meetings)} meetings, {len(transcripts)} transcripts, "
+        f"{len(notes)} notes, {len(chats)} chats\n"
+    )
+
+    # Classify meetings
+    classifications = {}
+    personal_count = 0
+    for meeting_id, meeting in meetings.items():
+        cls = classify_meeting(meeting["title"], meeting["participants"])
+        classifications[meeting_id] = cls
+        if cls == "personal":
+            personal_count += 1
+
+    print(
+        f"Classification: {len(meetings) - personal_count} work, "
+        f"{personal_count} personal\n"
+    )
+
+    # Save transcripts
+    transcript_saved = 0
+    for meeting_id, meeting in meetings.items():
+        if meeting_id in transcripts:
+            cls = classifications[meeting_id]
+            output_dir = (
+                PERSONAL_OUTPUT_DIR if cls == "personal" else WORK_OUTPUT_DIR
+            )
+            if save_transcript_to_file(
+                meeting, transcripts[meeting_id], output_dir, local_tz, cls
+            ):
+                transcript_saved += 1
+
+    # Save notes
+    notes_saved = 0
+    for meeting_id, meeting in meetings.items():
+        if meeting_id in notes:
+            cls = classifications[meeting_id]
+            output_dir = (
+                PERSONAL_OUTPUT_DIR if cls == "personal" else WORK_OUTPUT_DIR
+            )
+            if save_notes_to_file(
+                meeting, notes[meeting_id], output_dir, local_tz, cls
+            ):
+                notes_saved += 1
+
+    # Save chats
+    chats_saved = 0
+    for meeting_id, meeting in meetings.items():
+        if meeting_id in chats:
+            cls = classifications[meeting_id]
+            output_dir = (
+                PERSONAL_OUTPUT_DIR if cls == "personal" else WORK_OUTPUT_DIR
+            )
+            if save_chat_to_file(
+                meeting, chats[meeting_id], output_dir, local_tz, cls
+            ):
+                chats_saved += 1
+
+    total_saved = transcript_saved + notes_saved + chats_saved
+    write_status(success=True, saved_count=total_saved)
+
+    print(f"\n=== Backup Complete ===")
+    print(
+        f"Saved: {transcript_saved} transcripts, {notes_saved} notes, "
+        f"{chats_saved} chats"
+    )
+    print(f"Total: {len(transcripts)} transcripts in cache\n")
+
+
+if __name__ == "__main__":
+    main()
