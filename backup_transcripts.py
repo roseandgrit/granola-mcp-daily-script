@@ -107,6 +107,9 @@ PERSONAL_TITLE_PATTERNS = [
     r"\bimha\b", r"blue[\s._-]?pearl", r"dr[\W_]*davis",
     r"iv[\W_]*steroid", r"\bmri\b", r"blood[\W_]*issue",
     r"hospital[\W_]*stay", r"heaven",
+    # Personal-life contacts (added 2026-05-26 after Cheryl + Tony misclassification)
+    r"\bcheryl\b", r"\btony\b", r"\bquacy\b",
+    r"harmony[\s._-]?house", r"\banya\b", r"\bjoliz\b",
 ]
 WORK_PARTICIPANTS = [
     "tom", "amanda", "amandah", "austin", "alvin", "troy", "mark",
